@@ -320,11 +320,28 @@ namespace Majorsilence.Reporting.Rdl
 
         private static void NormalizeTablixes (XmlElement root, ReportLog rl)
         {
-            // Materialised first: the loop replaces nodes, which would invalidate a live walk.
-            foreach (var tablix in FindDescendants (root, "Tablix")) {
-                var table = TryConvertTablix (tablix, rl);
-                if (table != null)
-                    tablix.ParentNode.ReplaceChild (table, tablix);
+            // Converting a Tablix clones its cell contents into the new Table, so a Tablix
+            // nested inside another region re-enters the tree as an unconverted clone; repeat
+            // until a scan finds nothing new. Refused conversions stay in the tree and are
+            // tracked by reference so the loop terminates.
+            var refused = new List<XmlElement> ();
+            while (true) {
+                // Materialised each pass: the loop replaces nodes, which would invalidate a live walk.
+                var pending = new List<XmlElement> ();
+                foreach (var tablix in FindDescendants (root, "Tablix")) {
+                    if (!refused.Contains (tablix))
+                        pending.Add (tablix);
+                }
+                if (pending.Count == 0)
+                    return;
+
+                foreach (var tablix in pending) {
+                    var table = TryConvertTablix (tablix, rl);
+                    if (table != null)
+                        tablix.ParentNode.ReplaceChild (table, tablix);
+                    else
+                        refused.Add (tablix);
+                }
             }
         }
 
@@ -585,11 +602,34 @@ namespace Majorsilence.Reporting.Rdl
             "GridLayoutDefinition",
         };
 
+        private const string ReportDesignerNamespace =
+            "http://schemas.microsoft.com/SQLServer/reporting/reportdesigner";
+
         private static void RemoveVersionOnlyElements (XmlElement report)
         {
             foreach (var name in VersionOnlyElements) {
                 foreach (var element in FindDescendants (report, name))
                     element.ParentNode?.RemoveChild (element);
+            }
+
+            // Designer-namespace (rd:) elements are authoring metadata with no runtime meaning.
+            // Inside most containers they are merely noisy; inside ReportItems the parser treats
+            // them as dropped report items, which downstream consumers rightly refuse to render.
+            var designerElements = new List<XmlElement> ();
+            CollectDesignerElements (report, designerElements);
+            foreach (var element in designerElements)
+                element.ParentNode?.RemoveChild (element);
+        }
+
+        private static void CollectDesignerElements (XmlElement parent, List<XmlElement> found)
+        {
+            foreach (XmlNode node in parent.ChildNodes) {
+                if (node is not XmlElement element)
+                    continue;
+                if (string.Equals (element.NamespaceURI, ReportDesignerNamespace, StringComparison.OrdinalIgnoreCase))
+                    found.Add (element);
+                else
+                    CollectDesignerElements (element, found);
             }
         }
 

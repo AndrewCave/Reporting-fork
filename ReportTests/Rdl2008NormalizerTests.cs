@@ -294,6 +294,69 @@ namespace ReportTests
                 "an unsupported pivot layout should raise an error rather than render wrongly");
         }
 
+
+        [Test]
+        public async Task NestedTablix_InsideACell_IsAlsoConverted ()
+        {
+            // Converting the outer Tablix clones its cells into the new Table, so an inner
+            // Tablix arrives as a fresh unconverted clone and needs a second pass.
+            var inner = @"<Tablix Name=""Inner"">
+                <TablixBody>
+                  <TablixColumns><TablixColumn><Width>2in</Width></TablixColumn></TablixColumns>
+                  <TablixRows><TablixRow><Height>0.25in</Height><TablixCells><TablixCell><CellContents>" +
+                    Textbox ("InnerCell", "=Fields!Name.Value") + @"
+                  </CellContents></TablixCell></TablixCells></TablixRow></TablixRows>
+                </TablixBody>
+                <TablixColumnHierarchy><TablixMembers><TablixMember /></TablixMembers></TablixColumnHierarchy>
+                <TablixRowHierarchy><TablixMembers><TablixMember><Group Name=""InnerDetails"" /></TablixMember></TablixMembers></TablixRowHierarchy>
+                <DataSetName>Data</DataSetName>
+              </Tablix>";
+
+            var rdl = TablixReport (HeaderThenDetail,
+                Row ("0.25in", Cell (Textbox ("H1", "Name")), Cell (Textbox ("H2", "Amount"))) +
+                Row ("0.25in", Cell (inner), Cell (Textbox ("D2", "=Fields!Amount.Value"))));
+
+            using var report = await ParseAsync (rdl);
+
+            Assert.That (report.ErrorMaxSeverity, Is.LessThanOrEqualTo (4),
+                "nested tablix rejected: " + string.Join (" | ", report.ErrorItems ?? new System.Collections.ArrayList ()));
+        }
+
+        [Test]
+        public async Task DesignerNamespaceElements_AreStripped ()
+        {
+            // rd:* elements are authoring metadata; inside CellContents the parser would treat
+            // one as a dropped report item.
+            var cellWithDesignerNoise = "<TablixCell><CellContents><rd:Selected>true</rd:Selected>" +
+                Textbox ("D1", "=Fields!Name.Value") + "</CellContents></TablixCell>";
+
+            var rdl = TablixReport (HeaderThenDetail,
+                Row ("0.25in", Cell (Textbox ("H1", "Name")), Cell (Textbox ("H2", "Amount"))) +
+                $"<TablixRow><Height>0.25in</Height><TablixCells>{cellWithDesignerNoise}" +
+                Cell (Textbox ("D2", "=Fields!Amount.Value")) + "</TablixCells></TablixRow>");
+
+            using var report = await ParseAsync (rdl);
+
+            var errors = string.Join (" | ", report.ErrorItems ?? new System.Collections.ArrayList ());
+            Assert.That (errors, Does.Not.Contain ("rd:Selected"), "designer element leaked: " + errors);
+            Assert.That (report.ErrorMaxSeverity, Is.LessThanOrEqualTo (4), errors);
+        }
+
+        [Test]
+        public async Task MultiValueParameter_BareCountProperty_Parses ()
+        {
+            // Report Builder emits Parameters!X.Count (not Parameters!X.Value.Count).
+            var rdl = TablixReport (HeaderThenDetail,
+                Row ("0.25in", Cell (Textbox ("H1", "=Parameters!Clinics.Count")), Cell (Textbox ("H2", "Amount"))) +
+                Row ("0.25in", Cell (Textbox ("D1", "=Fields!Name.Value")), Cell (Textbox ("D2", "=Fields!Amount.Value"))))
+                .Replace ("<DataSets>",
+                    @"<ReportParameters><ReportParameter Name=""Clinics""><DataType>String</DataType><MultiValue>true</MultiValue></ReportParameter></ReportParameters><DataSets>");
+
+            using var report = await ParseAsync (rdl);
+
+            Assert.That (report.ErrorMaxSeverity, Is.LessThanOrEqualTo (4),
+                "Count expression rejected: " + string.Join (" | ", report.ErrorItems ?? new System.Collections.ArrayList ()));
+        }
         private static async Task<string> RenderHtml (string rdl)
         {
             using var report = await ParseAsync (rdl);
@@ -312,3 +375,4 @@ namespace ReportTests
         }
     }
 }
+

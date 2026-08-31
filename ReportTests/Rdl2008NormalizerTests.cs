@@ -274,8 +274,9 @@ namespace ReportTests
         [Test]
         public async Task DynamicColumnHierarchy_IsReportedRatherThanMisrendered ()
         {
-            // A dynamic column hierarchy is a pivot, which belongs on Matrix; converting it to a
-            // Table would silently produce the wrong shape, so it must be refused loudly.
+            // A pivot whose shape the Matrix converter cannot express (here: one leaf column in
+            // the hierarchy but two body columns, and a header row mixed in with the row group)
+            // must still be refused loudly rather than rendered wrongly.
             const string dynamicColumns = @"
                 <TablixMembers>
                   <TablixMember><Group Name=""ColGroup""><GroupExpressions>
@@ -357,6 +358,169 @@ namespace ReportTests
             Assert.That (report.ErrorMaxSeverity, Is.LessThanOrEqualTo (4),
                 "Count expression rejected: " + string.Join (" | ", report.ErrorItems ?? new System.Collections.ArrayList ()));
         }
+        #region Matrix (dynamic column hierarchy)
+
+        /// <summary>
+        /// A Tablix whose column hierarchy pivots on data. Body dimensions default to one cell,
+        /// which is the leaf shape of a plain matrix; the groupings multiply it at run time.
+        /// </summary>
+        private static string MatrixTablixReport (string columnHierarchy, string rowHierarchy, string bodyRows,
+            int bodyColumns = 1, string corner = "")
+        {
+            var columns = string.Empty;
+            for (var i = 0; i < bodyColumns; i++)
+                columns += "<TablixColumn><Width>1in</Width></TablixColumn>";
+
+            return $@"<?xml version=""1.0"" encoding=""UTF-8""?>
+<Report xmlns=""{Rdl2008Namespace}"" xmlns:rd=""http://schemas.microsoft.com/SQLServer/reporting/reportdesigner"">
+  <DataSources>
+    <DataSource Name=""DS1"">
+      <ConnectionProperties>
+        <DataProvider>SQLite</DataProvider>
+        <ConnectString>Data Source=this-file-does-not-exist.db</ConnectString>
+      </ConnectionProperties>
+    </DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name=""Data"">
+      <Query><DataSourceName>DS1</DataSourceName><CommandText>/* Local Query */</CommandText></Query>
+      <Fields>
+        <Field Name=""Name""><DataField>Name</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name=""Amount""><DataField>Amount</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+      </Fields>
+    </DataSet>
+  </DataSets>
+  <Body>
+    <ReportItems>
+      <Tablix Name=""Pivot1"">
+        <TablixBody>
+          <TablixColumns>{columns}</TablixColumns>
+          <TablixRows>{bodyRows}</TablixRows>
+        </TablixBody>
+        <TablixColumnHierarchy><TablixMembers>{columnHierarchy}</TablixMembers></TablixColumnHierarchy>
+        <TablixRowHierarchy><TablixMembers>{rowHierarchy}</TablixMembers></TablixRowHierarchy>
+        {corner}
+        <RepeatColumnHeaders>true</RepeatColumnHeaders>
+        <DataSetName>Data</DataSetName>
+        <Top>0in</Top>
+        <Height>0.5in</Height>
+        <Width>4in</Width>
+      </Tablix>
+    </ReportItems>
+    <Height>2in</Height>
+  </Body>
+  <Width>6in</Width>
+</Report>";
+        }
+
+        private static string DynamicMember (string groupName, string groupExpression,
+            string headerTextbox = null, string sortExpression = null, string nested = null)
+            => $@"<TablixMember>
+                    <Group Name=""{groupName}"">
+                      <GroupExpressions><GroupExpression>{groupExpression}</GroupExpression></GroupExpressions>
+                    </Group>
+                    {(sortExpression == null ? string.Empty
+                        : $"<SortExpressions><SortExpression><Value>{sortExpression}</Value></SortExpression></SortExpressions>")}
+                    {(headerTextbox == null ? string.Empty
+                        : $"<TablixHeader><Size>0.3in</Size><CellContents>{headerTextbox}</CellContents></TablixHeader>")}
+                    {(nested == null ? string.Empty : $"<TablixMembers>{nested}</TablixMembers>")}
+                  </TablixMember>";
+
+        private static string StaticMember (string headerTextbox = null)
+            => headerTextbox == null
+                ? "<TablixMember />"
+                : $@"<TablixMember><TablixHeader><Size>1in</Size><CellContents>{headerTextbox}</CellContents></TablixHeader></TablixMember>";
+
+        [Test]
+        public async Task DynamicColumns_ConvertToMatrix_AndPivotTheData ()
+        {
+            // One column per distinct Name, one static row: the defining matrix behaviour.
+            var rdl = MatrixTablixReport (
+                DynamicMember ("ColName", "=Fields!Name.Value", Textbox ("ColHead", "=Fields!Name.Value")),
+                StaticMember (Textbox ("RowHead", "AmountsByName")),
+                Row ("0.25in", Cell (Textbox ("Data", "=First(Fields!Amount.Value)"))));
+
+            var html = await RenderHtml (rdl);
+
+            Assert.That (html, Does.Contain ("Widget"), "first group instance header missing");
+            Assert.That (html, Does.Contain ("Gadget"), "second group instance header missing");
+            Assert.That (html, Does.Contain ("10.00"), "first pivoted cell missing");
+            Assert.That (html, Does.Contain ("20.00"), "second pivoted cell missing");
+            Assert.That (html, Does.Contain ("AmountsByName"), "row header missing");
+        }
+
+        [Test]
+        public async Task DynamicRowsAndColumns_BothPivot ()
+        {
+            var rdl = MatrixTablixReport (
+                DynamicMember ("ColAmount", "=Fields!Amount.Value", Textbox ("ColHead", "=Fields!Amount.Value")),
+                DynamicMember ("RowName", "=Fields!Name.Value", Textbox ("RowHead", "=Fields!Name.Value")),
+                Row ("0.25in", Cell (Textbox ("Data", "=Count(Fields!Name.Value)"))));
+
+            var html = await RenderHtml (rdl);
+
+            Assert.That (html, Does.Contain ("Widget").And.Contain ("Gadget"), "row group headers missing");
+            Assert.That (html, Does.Contain ("10.00").And.Contain ("20.00"), "column group headers missing");
+        }
+
+        [Test]
+        public async Task ColumnGroupSort_IsCarriedAcross ()
+        {
+            // Data order is Widget then Gadget; an ascending sort must flip the column order,
+            // proving SortExpressions became 2005 Sorting rather than being dropped.
+            var rdl = MatrixTablixReport (
+                DynamicMember ("ColName", "=Fields!Name.Value", Textbox ("ColHead", "=Fields!Name.Value"),
+                    sortExpression: "=Fields!Name.Value"),
+                StaticMember (Textbox ("RowHead", "AmountsByName")),
+                Row ("0.25in", Cell (Textbox ("Data", "=First(Fields!Amount.Value)"))));
+
+            var html = await RenderHtml (rdl);
+
+            Assert.That (html.IndexOf ("Gadget", StringComparison.Ordinal),
+                Is.GreaterThanOrEqualTo (0).And.LessThan (html.IndexOf ("Widget", StringComparison.Ordinal)),
+                "ascending sort should put Gadget before Widget");
+        }
+
+        [Test]
+        public async Task CornerContent_IsPreserved ()
+        {
+            var corner = @"<TablixCorner><TablixCornerRows><TablixCornerRow>
+                             <TablixCornerCell><CellContents>" + Textbox ("CornerBox", "CornerLabel") + @"</CellContents></TablixCornerCell>
+                           </TablixCornerRow></TablixCornerRows></TablixCorner>";
+
+            var rdl = MatrixTablixReport (
+                DynamicMember ("ColName", "=Fields!Name.Value", Textbox ("ColHead", "=Fields!Name.Value")),
+                StaticMember (Textbox ("RowHead", "AmountsByName")),
+                Row ("0.25in", Cell (Textbox ("Data", "=First(Fields!Amount.Value)"))),
+                corner: corner);
+
+            var html = await RenderHtml (rdl);
+
+            Assert.That (html, Does.Contain ("CornerLabel"));
+        }
+
+        [Test]
+        public async Task StaticSiblingOfDynamicMember_IsRefused ()
+        {
+            // A static member alongside a dynamic one is a subtotal column. Converting without it
+            // would silently drop a totals column from the output, so the region must refuse.
+            var rdl = MatrixTablixReport (
+                DynamicMember ("ColName", "=Fields!Name.Value", Textbox ("ColHead", "=Fields!Name.Value")) +
+                StaticMember (Textbox ("TotalHead", "Total")),
+                StaticMember (Textbox ("RowHead", "AmountsByName")),
+                Row ("0.25in",
+                    Cell (Textbox ("Data", "=First(Fields!Amount.Value)")) +
+                    Cell (Textbox ("DataTotal", "=Sum(Fields!Amount.Value)"))),
+                bodyColumns: 2);
+
+            using var report = await ParseAsync (rdl);
+
+            Assert.That (report.ErrorMaxSeverity, Is.GreaterThanOrEqualTo (8),
+                "a subtotal layout the converter cannot express must refuse rather than drop the column");
+        }
+
+        #endregion
+
         private static async Task<string> RenderHtml (string rdl)
         {
             using var report = await ParseAsync (rdl);

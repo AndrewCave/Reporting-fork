@@ -354,11 +354,10 @@ namespace Majorsilence.Reporting.Rdl
                 return null;
             }
 
-            if (HasDynamicMembers (FindChild (tablix, "TablixColumnHierarchy"))) {
-                rl?.LogError (8, $"Tablix '{name}' has a dynamic column hierarchy (a pivot/matrix), " +
-                    "which is not supported yet; the region was ignored.");
-                return null;
-            }
+            // A dynamic column hierarchy pivots on data, which Table cannot express; that shape
+            // is 2005's Matrix.
+            if (HasDynamicMembers (FindChild (tablix, "TablixColumnHierarchy")))
+                return TryConvertTablixToMatrix (tablix, rl);
 
             var rows = ChildrenNamed (FindChild (body, "TablixRows"), "TablixRow");
             var placements = ClassifyRows (FindChild (tablix, "TablixRowHierarchy"), rows.Count, name, rl);
@@ -582,6 +581,471 @@ namespace Majorsilence.Reporting.Rdl
 
             return wrapper;
         }
+
+        #endregion
+
+        #region Matrix
+
+        /// <summary>
+        /// One level of a Tablix hierarchy read for Matrix conversion: either a single grouped
+        /// member (a dynamic level) or a run of leaf static members (the innermost level).
+        /// </summary>
+        private sealed class AxisLevel
+        {
+            internal XmlElement Dynamic;
+            internal List<XmlElement> Statics;
+        }
+
+        /// <summary>
+        /// Converts a Tablix with a dynamic column hierarchy into a 2005 Matrix. The Matrix model
+        /// only expresses "regular" pivots -- uniform grouping levels with at most one static leaf
+        /// level per axis -- so ragged hierarchies (subtotal siblings, adjacent groups, stacked
+        /// static headers) are refused loudly rather than converted approximately.
+        /// </summary>
+        private static XmlElement TryConvertTablixToMatrix (XmlElement tablix, ReportLog rl)
+        {
+            var name = tablix.GetAttribute ("Name");
+            var body = FindChild (tablix, "TablixBody");
+
+            var columnLevels = ReadAxisLevels (FindChild (tablix, "TablixColumnHierarchy"), "column", name, rl);
+            if (columnLevels == null)
+                return null;
+
+            var rowLevels = ReadAxisLevels (FindChild (tablix, "TablixRowHierarchy"), "row", name, rl);
+            if (rowLevels == null)
+                return null;
+
+            TrimBareLeafLevel (columnLevels);
+            TrimBareLeafLevel (rowLevels);
+
+            var bodyColumns = ChildrenNamed (FindChild (body, "TablixColumns"), "TablixColumn");
+            var bodyRows = ChildrenNamed (FindChild (body, "TablixRows"), "TablixRow");
+
+            if (bodyColumns.Count != LeafCount (columnLevels) || bodyRows.Count != LeafCount (rowLevels)) {
+                rl?.LogError (8, $"Tablix '{name}' has a {bodyRows.Count}x{bodyColumns.Count} body but its " +
+                    $"hierarchies describe {LeafCount (rowLevels)}x{LeafCount (columnLevels)} leaf cell(s); " +
+                    "this pivot layout is not supported yet and the region was ignored.");
+                return null;
+            }
+
+            // Matrix cells cannot span, and a placeholder for a spanned-over position would shift
+            // every later cell in its row.
+            foreach (var bodyRow in bodyRows) {
+                foreach (var cell in ChildrenNamed (FindChild (bodyRow, "TablixCells"), "TablixCell")) {
+                    if (FindChild (cell, "CellContents") == null) {
+                        rl?.LogError (8, $"Tablix '{name}' has merged (spanned) cells in its pivot body; " +
+                            "this layout is not supported yet and the region was ignored.");
+                        return null;
+                    }
+                }
+            }
+
+            var doc = tablix.OwnerDocument;
+            var ns = tablix.NamespaceURI;
+            var matrix = doc.CreateElement ("Matrix", ns);
+
+            if (!string.IsNullOrEmpty (name))
+                matrix.SetAttribute ("Name", name);
+
+            foreach (var child in Children (tablix)) {
+                switch (child.LocalName) {
+                    case "TablixBody":
+                    case "TablixColumnHierarchy":
+                    case "TablixRowHierarchy":
+                    case "TablixCorner":
+                    // Pagination hints with no Matrix counterpart; dropping them silently beats a
+                    // per-report "unknown element" warning for each.
+                    case "RepeatColumnHeaders":
+                    case "RepeatRowHeaders":
+                    case "FixedColumnHeaders":
+                    case "FixedRowHeaders":
+                        continue;
+                    default:
+                        matrix.AppendChild (child.CloneNode (true));
+                        break;
+                }
+            }
+
+            var corner = BuildCorner (doc, ns, FindChild (tablix, "TablixCorner"), rowLevels, columnLevels, rl, name);
+            if (corner != null)
+                matrix.AppendChild (corner);
+
+            matrix.AppendChild (BuildGroupings (doc, ns, columnLevels, isColumnAxis: true));
+            matrix.AppendChild (BuildGroupings (doc, ns, rowLevels, isColumnAxis: false));
+
+            var matrixRows = doc.CreateElement ("MatrixRows", ns);
+            foreach (var bodyRow in bodyRows) {
+                var matrixRow = doc.CreateElement ("MatrixRow", ns);
+
+                var height = FindChild (bodyRow, "Height");
+                if (height != null)
+                    matrixRow.AppendChild (height.CloneNode (true));
+
+                var matrixCells = doc.CreateElement ("MatrixCells", ns);
+                foreach (var cell in ChildrenNamed (FindChild (bodyRow, "TablixCells"), "TablixCell")) {
+                    var matrixCell = doc.CreateElement ("MatrixCell", ns);
+                    matrixCell.AppendChild (BuildSingleItem (doc, ns, FindChild (cell, "CellContents")));
+                    matrixCells.AppendChild (matrixCell);
+                }
+
+                matrixRow.AppendChild (matrixCells);
+                matrixRows.AppendChild (matrixRow);
+            }
+            matrix.AppendChild (matrixRows);
+
+            var matrixColumns = doc.CreateElement ("MatrixColumns", ns);
+            foreach (var bodyColumn in bodyColumns) {
+                var matrixColumn = doc.CreateElement ("MatrixColumn", ns);
+
+                var width = FindChild (bodyColumn, "Width");
+                if (width != null)
+                    matrixColumn.AppendChild (width.CloneNode (true));
+
+                matrixColumns.AppendChild (matrixColumn);
+            }
+            matrix.AppendChild (matrixColumns);
+
+            return matrix;
+        }
+
+        /// <summary>
+        /// Reads a Tablix hierarchy as a list of uniform levels, or refuses (null) when the tree
+        /// is ragged. Each level is either exactly one grouped member, or -- only at the innermost
+        /// level -- a run of leaf static members.
+        /// </summary>
+        private static List<AxisLevel> ReadAxisLevels (XmlElement hierarchy, string axis, string tablixName, ReportLog rl)
+        {
+            var levels = new List<AxisLevel> ();
+            var top = FindChild (hierarchy, "TablixMembers");
+            var members = top == null ? new List<XmlElement> () : ChildrenNamed (top, "TablixMember");
+
+            while (members.Count > 0) {
+                var allLeafStatic = true;
+                foreach (var member in members) {
+                    if (FindChild (member, "Group") != null || FindChild (member, "TablixMembers") != null) {
+                        allLeafStatic = false;
+                        break;
+                    }
+                }
+
+                if (allLeafStatic) {
+                    levels.Add (new AxisLevel { Statics = members });
+                    return levels;
+                }
+
+                if (members.Count != 1) {
+                    // A static member alongside a grouped one is a subtotal; grouped siblings are
+                    // adjacent pivots. Either way there is no uniform-level Matrix equivalent, and
+                    // converting without them would silently drop rows or columns.
+                    rl?.LogError (8, $"Tablix '{tablixName}' mixes grouped and static members on its {axis} " +
+                        "hierarchy (adjacent groups or subtotals); this pivot layout is not supported yet " +
+                        "and the region was ignored.");
+                    return null;
+                }
+
+                var only = members[0];
+                if (FindChild (only, "Group") == null) {
+                    rl?.LogError (8, $"Tablix '{tablixName}' has stacked static members on its {axis} " +
+                        "hierarchy; this pivot layout is not supported yet and the region was ignored.");
+                    return null;
+                }
+
+                levels.Add (new AxisLevel { Dynamic = only });
+
+                var nested = FindChild (only, "TablixMembers");
+                members = nested == null ? new List<XmlElement> () : ChildrenNamed (nested, "TablixMember");
+            }
+
+            return levels;
+        }
+
+        /// <summary>
+        /// A single headerless static leaf under a group is just the 2008 way of writing "one body
+        /// cell"; the level carries nothing a Matrix needs to model.
+        /// </summary>
+        private static void TrimBareLeafLevel (List<AxisLevel> levels)
+        {
+            if (levels.Count < 2)
+                return;
+
+            var last = levels[levels.Count - 1];
+            if (last.Statics != null && last.Statics.Count == 1 && FindChild (last.Statics[0], "TablixHeader") == null)
+                levels.RemoveAt (levels.Count - 1);
+        }
+
+        private static int LeafCount (List<AxisLevel> levels)
+        {
+            if (levels.Count == 0)
+                return 1;
+
+            var last = levels[levels.Count - 1];
+            return last.Statics?.Count ?? 1;
+        }
+
+        /// <summary>Builds ColumnGroupings or RowGroupings from the levels of one axis.</summary>
+        private static XmlElement BuildGroupings (XmlDocument doc, string ns, List<AxisLevel> levels, bool isColumnAxis)
+        {
+            var groupings = doc.CreateElement (isColumnAxis ? "ColumnGroupings" : "RowGroupings", ns);
+
+            // Matrix requires at least one grouping per axis; a Tablix axis with no members at all
+            // (or nothing left after trimming) means a single unlabelled band.
+            if (levels.Count == 0)
+                levels = new List<AxisLevel> { new AxisLevel { Statics = new List<XmlElement> () } };
+
+            foreach (var level in levels) {
+                var grouping = doc.CreateElement (isColumnAxis ? "ColumnGrouping" : "RowGrouping", ns);
+                var sizeName = isColumnAxis ? "Height" : "Width";
+
+                if (level.Dynamic != null) {
+                    grouping.AppendChild (BuildSize (doc, ns, sizeName, HeaderSize (level.Dynamic)));
+
+                    var dynamic = doc.CreateElement (isColumnAxis ? "DynamicColumns" : "DynamicRows", ns);
+                    dynamic.AppendChild (BuildGrouping (doc, ns, FindChild (level.Dynamic, "Group")));
+
+                    var sortExpressions = FindChild (level.Dynamic, "SortExpressions");
+                    if (sortExpressions != null)
+                        dynamic.AppendChild (BuildSorting (doc, ns, sortExpressions));
+
+                    var visibility = FindChild (level.Dynamic, "Visibility");
+                    if (visibility != null)
+                        dynamic.AppendChild (visibility.CloneNode (true));
+
+                    dynamic.AppendChild (BuildSingleItem (doc, ns, HeaderContents (level.Dynamic)));
+                    grouping.AppendChild (dynamic);
+                } else {
+                    var size = "0in";
+                    foreach (var member in level.Statics) {
+                        var s = HeaderSize (member);
+                        if (s != null) {
+                            size = s;
+                            break;
+                        }
+                    }
+                    grouping.AppendChild (BuildSize (doc, ns, sizeName, size));
+
+                    var statics = doc.CreateElement (isColumnAxis ? "StaticColumns" : "StaticRows", ns);
+                    if (level.Statics.Count == 0) {
+                        statics.AppendChild (BuildStaticMember (doc, ns, isColumnAxis, null));
+                    } else {
+                        foreach (var member in level.Statics)
+                            statics.AppendChild (BuildStaticMember (doc, ns, isColumnAxis, HeaderContents (member)));
+                    }
+                    grouping.AppendChild (statics);
+                }
+
+                groupings.AppendChild (grouping);
+            }
+
+            return groupings;
+        }
+
+        private static XmlElement BuildStaticMember (XmlDocument doc, string ns, bool isColumnAxis, XmlElement contents)
+        {
+            var member = doc.CreateElement (isColumnAxis ? "StaticColumn" : "StaticRow", ns);
+            member.AppendChild (BuildSingleItem (doc, ns, contents));
+            return member;
+        }
+
+        private static XmlElement BuildSize (XmlDocument doc, string ns, string name, string value)
+        {
+            var size = doc.CreateElement (name, ns);
+            size.InnerText = value ?? "0in";
+            return size;
+        }
+
+        private static string HeaderSize (XmlElement member)
+            => FindChild (FindChild (member, "TablixHeader"), "Size")?.InnerText;
+
+        private static XmlElement HeaderContents (XmlElement member)
+            => FindChild (FindChild (member, "TablixHeader"), "CellContents");
+
+        /// <summary>Tablix's Group carries its name as an attribute, exactly like 2005's Grouping.</summary>
+        private static XmlElement BuildGrouping (XmlDocument doc, string ns, XmlElement group)
+        {
+            var grouping = doc.CreateElement ("Grouping", ns);
+
+            var name = group.GetAttribute ("Name");
+            if (!string.IsNullOrEmpty (name))
+                grouping.SetAttribute ("Name", name);
+
+            foreach (var child in Children (group))
+                grouping.AppendChild (child.CloneNode (true));
+
+            return grouping;
+        }
+
+        /// <summary>2008 SortExpressions/SortExpression{Value,Direction} to 2005 Sorting/SortBy.</summary>
+        private static XmlElement BuildSorting (XmlDocument doc, string ns, XmlElement sortExpressions)
+        {
+            var sorting = doc.CreateElement ("Sorting", ns);
+
+            foreach (var sortExpression in ChildrenNamed (sortExpressions, "SortExpression")) {
+                var sortBy = doc.CreateElement ("SortBy", ns);
+
+                var expression = doc.CreateElement ("SortExpression", ns);
+                expression.InnerText = FindChild (sortExpression, "Value")?.InnerText ?? string.Empty;
+                sortBy.AppendChild (expression);
+
+                var direction = FindChild (sortExpression, "Direction");
+                if (direction != null)
+                    sortBy.AppendChild (direction.CloneNode (true));
+
+                sorting.AppendChild (sortBy);
+            }
+
+            return sorting;
+        }
+
+        /// <summary>
+        /// ReportItems holding exactly one item, from CellContents that may hold none or several.
+        /// The Matrix positions (DynamicColumns, StaticRow, MatrixCell, Corner) all require it.
+        /// </summary>
+        private static XmlElement BuildSingleItem (XmlDocument doc, string ns, XmlElement contents)
+        {
+            var items = doc.CreateElement ("ReportItems", ns);
+
+            if (contents != null) {
+                foreach (var child in Children (contents)) {
+                    if (child.LocalName == "ColSpan" || child.LocalName == "RowSpan")
+                        continue;
+
+                    items.AppendChild (child.CloneNode (true));
+                }
+            }
+
+            if (items.ChildNodes.Count == 0)
+                items.AppendChild (BuildEmptyTextbox (doc, ns));
+            else if (items.ChildNodes.Count > 1)
+                items = WrapInRectangle (doc, ns, items);
+
+            return items;
+        }
+
+        /// <summary>
+        /// The Tablix corner is a grid of cells over the row-header columns; 2005's Corner holds a
+        /// single item. One cell maps directly; several are laid out inside a Rectangle, at offsets
+        /// taken from the row-level widths and column-level heights when the units allow it.
+        /// </summary>
+        private static XmlElement BuildCorner (XmlDocument doc, string ns, XmlElement tablixCorner,
+            List<AxisLevel> rowLevels, List<AxisLevel> columnLevels, ReportLog rl, string tablixName)
+        {
+            if (tablixCorner == null)
+                return null;
+
+            var items = new List<XmlElement> ();
+            var cornerRows = ChildrenNamed (FindChild (tablixCorner, "TablixCornerRows"), "TablixCornerRow");
+
+            for (var rowIndex = 0; rowIndex < cornerRows.Count; rowIndex++) {
+                var cells = ChildrenNamed (cornerRows[rowIndex], "TablixCornerCell");
+                for (var cellIndex = 0; cellIndex < cells.Count; cellIndex++) {
+                    var contents = FindChild (cells[cellIndex], "CellContents");
+                    if (contents == null)
+                        continue;   // spanned-over placeholder
+
+                    foreach (var child in Children (contents)) {
+                        if (child.LocalName == "ColSpan" || child.LocalName == "RowSpan")
+                            continue;
+
+                        var item = (XmlElement)child.CloneNode (true);
+                        PositionCornerItem (doc, ns, item, cellIndex, rowIndex, rowLevels, columnLevels);
+                        items.Add (item);
+                    }
+                }
+            }
+
+            if (items.Count == 0)
+                return null;
+
+            var corner = doc.CreateElement ("Corner", ns);
+            if (items.Count == 1) {
+                var single = doc.CreateElement ("ReportItems", ns);
+                single.AppendChild (items[0]);
+                corner.AppendChild (single);
+            } else {
+                var grouped = doc.CreateElement ("ReportItems", ns);
+                foreach (var item in items)
+                    grouped.AppendChild (item);
+                corner.AppendChild (WrapInRectangle (doc, ns, grouped));
+            }
+
+            return corner;
+        }
+
+        /// <summary>
+        /// Sets Top/Left/Width/Height on a corner item from the sizes of the levels before it.
+        /// Sizes in mixed units are left unset; the layout degrades but nothing is lost.
+        /// </summary>
+        private static void PositionCornerItem (XmlDocument doc, string ns, XmlElement item,
+            int cellIndex, int rowIndex, List<AxisLevel> rowLevels, List<AxisLevel> columnLevels)
+        {
+            string LevelSize (List<AxisLevel> levels, int index)
+            {
+                if (index >= levels.Count)
+                    return null;
+
+                var level = levels[index];
+                if (level.Dynamic != null)
+                    return HeaderSize (level.Dynamic) ?? "0in";
+
+                foreach (var member in level.Statics) {
+                    var s = HeaderSize (member);
+                    if (s != null)
+                        return s;
+                }
+                return "0in";
+            }
+
+            void Set (string elementName, string value)
+            {
+                if (value == null || FindChild (item, elementName) != null)
+                    return;
+
+                var element = doc.CreateElement (elementName, ns);
+                element.InnerText = value;
+                item.AppendChild (element);
+            }
+
+            string Sum (Func<int, string> sizeAt, int count)
+            {
+                double total = 0;
+                string unit = null;
+                for (var i = 0; i < count; i++) {
+                    var size = sizeAt (i);
+                    if (size == null)
+                        return null;
+
+                    var parsed = ParseSize (size);
+                    if (parsed == null || (unit != null && unit != parsed.Value.Unit))
+                        return null;
+
+                    unit = parsed.Value.Unit;
+                    total += parsed.Value.Value;
+                }
+                return unit == null ? "0in" : FormatSize (total, unit);
+            }
+
+            Set ("Left", cellIndex == 0 ? "0in" : Sum (i => LevelSize (rowLevels, i), cellIndex));
+            Set ("Top", rowIndex == 0 ? "0in" : Sum (i => LevelSize (columnLevels, i), rowIndex));
+            Set ("Width", LevelSize (rowLevels, cellIndex));
+            Set ("Height", LevelSize (columnLevels, rowIndex));
+        }
+
+        private static (double Value, string Unit)? ParseSize (string size)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match (size.Trim (),
+                @"^([\d.]+)\s*([a-zA-Z]+)$");
+            if (!match.Success)
+                return null;
+
+            if (!double.TryParse (match.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var value))
+                return null;
+
+            return (value, match.Groups[2].Value.ToLowerInvariant ());
+        }
+
+        private static string FormatSize (double value, string unit)
+            => value.ToString ("0.#####", System.Globalization.CultureInfo.InvariantCulture) + unit;
 
         #endregion
 

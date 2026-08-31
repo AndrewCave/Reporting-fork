@@ -275,11 +275,13 @@ namespace Majorsilence.Reporting.Rdl
 					case TokenTypes.MINUS:
 						if (bDecimal)
 							result = new FunctionMinusDecimal(lhs, rhs);
-						else if (bString)
-							throw new ParserException(Strings.Parser_ErrorP_MinusNeedNumbers + GetLocationInfo(curToken));
                         else if (bInt32)
                             result = new FunctionMinusInt32(lhs, rhs);
                         else
+							// A String-typed operand is routinely a parameter or field whose
+							// declared type is String but whose values are numeric
+							// ("=Parameters!Count.Value - 1"); SSRS coerces at runtime, so
+							// defer to FunctionMinus's numeric evaluation instead of refusing.
 							result = new FunctionMinus(lhs, rhs);
 						break;
 				}
@@ -298,7 +300,8 @@ namespace Majorsilence.Reporting.Rdl
 			result = lhs;			// in case we get no matches
 			while ((t = curToken.Type) == TokenTypes.FORWARDSLASH ||
 				t == TokenTypes.STAR ||
-				t == TokenTypes.MODULUS)
+				t == TokenTypes.MODULUS ||
+				t == TokenTypes.BACKSLASH)
 			{
 				curToken = tokens.Extract();
 				IExpr rhs;
@@ -321,6 +324,9 @@ namespace Majorsilence.Reporting.Rdl
 						break;
 					case TokenTypes.MODULUS:
 						result = new FunctionModulus(lhs, rhs);
+						break;
+					case TokenTypes.BACKSLASH:
+						result = new FunctionDivInteger(lhs, rhs);
 						break;
 				}
 				lhs = result;		// in case continue in the loop
@@ -542,6 +548,14 @@ namespace Majorsilence.Reporting.Rdl
 					result = new FunctionTextbox(t, idLookup.ExpressionName);	
 					return (true, result);
 				case "globals":
+					// Globals!RenderFormat.Name (RDL 2008+): the active output format,
+					// commonly used to toggle export-only columns.
+					if (string.Equals(method, "RenderFormat", StringComparison.OrdinalIgnoreCase)
+						&& (thirdPart == null || string.Equals(thirdPart, "Name", StringComparison.OrdinalIgnoreCase)))
+					{
+						result = new FunctionRenderFormatName();
+						return (true, result);
+					}
 					e = idLookup.LookupGlobal(method);
 					if (e == null)
 						throw new ParserException(string.Format(Strings.Parser_ErrorP_GlobalsNotFound, method));
@@ -606,6 +620,15 @@ namespace Majorsilence.Reporting.Rdl
 				bool isRunningValue = method.ToLower() == "runningvalue";
 				int commasBeforeScope = isRunningValue ? 2 : 1;
 				int commaCount = 0;
+				// The first token after '(' is already in curToken, not in the stream. A
+				// zero-argument aggregate — IIf(CountRows() = 0, a, b) — otherwise scans past
+				// its own closing paren and captures the enclosing call's next argument as
+				// its scope; an opening paren in curToken likewise needs its level counted.
+				if (curToken.Type == TokenTypes.RPAREN)
+					level = -1;
+				else if (curToken.Type == TokenTypes.LPAREN)
+					level++;
+				if (level >= 0)
 				foreach(Token tok in tokens)
 				{
 					if(nextScope)
@@ -1059,12 +1082,17 @@ namespace Majorsilence.Reporting.Rdl
             else
                 arrayMethod = null;
 
-            if (vf == null || vf == "Value")
+            if (vf == null || string.Equals(vf, "Value", StringComparison.OrdinalIgnoreCase))
                 result = new FunctionReportParameter(p);
-            else if (vf == "Label")
+            else if (string.Equals(vf, "Label", StringComparison.OrdinalIgnoreCase))
                 result = new FunctionReportParameterLabel(p);
             else
                 throw new ParserException(string.Format(Strings.Parser_ErrorP_ParameterSupportsValueAndLabel, pname));
+
+            // Parameters!X.Value.ToString() is a no-op accessor, not a multi-value method.
+            if (string.Equals(arrayMethod, "ToString", StringComparison.OrdinalIgnoreCase)
+                && (args == null || args.Length == 0))
+                return result;
 
             result.SetParameterMethod(arrayMethod, args);
 

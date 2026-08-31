@@ -124,6 +124,8 @@ namespace Majorsilence.Reporting.Rdl
 						}
 						else
 							return new Token(ch.ToString(), reader.Line, reader.Column, reader.Line, reader.Column, TokenTypes.FORWARDSLASH);
+					case '\\':	// VB integer division operator
+						return new Token(ch.ToString(), reader.Line, reader.Column, reader.Line, reader.Column, TokenTypes.BACKSLASH);
 					case '<':
 						if (reader.Peek() == '=')
 						{

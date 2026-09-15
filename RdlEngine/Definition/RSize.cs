@@ -91,28 +91,40 @@ namespace Majorsilence.Reporting.Rdl
 				return;
 			}
 
+			// Rounded, not truncated. _Size counts parts of 1/2540 inch, and a cast to int
+			// throws the fraction away - so every dimension came out up to one part short
+			// (0.0004in, about a tenth of a pixel at 300dpi), always in the same direction.
+			// On a one-off that is invisible; on a table row it is a pitch. A 289-twip row
+			// is 509.76 parts, truncated to 509, and thirty of them put a report's last row
+			// about 3px above where the reference renderer draws it.
+			//
+			// Rounding is also what lets an exact measurement land where it belongs. 289
+			// twips written exactly - "14.45pt" - is 509.76 parts and rounds to 510, which
+			// is the pitch the reference uses. Truncation reached 510 only when the caller
+			// happened to round the value up on the way in, so callers were being rewarded
+			// for being imprecise.
 			switch(u)			// convert to millimeters
 			{
                 case "in": //Inches
-                    _Size = (int)(d * PARTS_PER_INCH);
+                    _Size = (int)decimal.Round(d * PARTS_PER_INCH);
                     break;
                 case "cm": //Centimeters
-                    _Size = (int)(d * PARTS_PER_CM);
+                    _Size = (int)decimal.Round(d * PARTS_PER_CM);
                     break;
                 case "mm": //Millimeters
-                    _Size = (int)(d * PARTS_PER_MM);
+                    _Size = (int)decimal.Round(d * PARTS_PER_MM);
                     break;
                 case "pt": //Points
-                    _Size = (int)(d * PARTS_PER_POINT);
+                    _Size = (int)decimal.Round(d * PARTS_PER_POINT);
                     break;
                 case "pc": //Picas
-                    _Size = (int)(d * PARTS_PER_PICA);
+                    _Size = (int)decimal.Round(d * PARTS_PER_PICA);
                     break;
                 default:
                     // Illegal unit
                     if (r != null)
                         r.rl.LogError(4, "Unknown sizing unit '" + u + "' specified, assuming inches.");
-                    _Size = (int)(d * PARTS_PER_INCH);
+                    _Size = (int)decimal.Round(d * PARTS_PER_INCH);
                     break;
 			}
 			if (_Size > 160 * 2540)	// Size can't be greater than 160 inches according to spec

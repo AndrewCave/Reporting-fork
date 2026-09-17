@@ -193,7 +193,11 @@ namespace Majorsilence.Reporting.Rdl
                 MemoryStream ostrm = new MemoryStream();
                 ImageFormat imf;
                 
-                switch (mtype.ToLower())
+                // Null-conditional deliberately: an unknown media type belongs in the default
+                // branch below, which re-encodes whatever was decoded. Throwing here instead
+                // discarded an image the engine had already loaded successfully, and the catch
+                // reported it as a load failure, which it was not.
+                switch (mtype?.ToLower())
                 {
                     case "image/jpeg":
                         imf = ImageFormat.Jpeg;
@@ -289,6 +293,13 @@ namespace Majorsilence.Reporting.Rdl
                                 client.AddMajorsilenceReportingUserAgent();
                                 HttpResponseMessage response = await client.GetAsync(fname);
                                 response.EnsureSuccessStatusCode();
+                                // GetMimeType reads the extension off the URL, which an API
+                                // endpoint -- ".../render/image?source=..." -- does not
+                                // have, so it returns null and the caller's switch on
+                                // mtype.ToLower() throws into the catch that treats it as an
+                                // unloadable image. The response says what it sent; believe it.
+                                if (mtype == null)
+                                    mtype = response.Content.Headers.ContentType?.MediaType;
                                 strm = await response.Content.ReadAsStreamAsync();
                             }
                         }

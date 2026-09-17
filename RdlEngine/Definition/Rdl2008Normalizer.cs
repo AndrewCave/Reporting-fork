@@ -371,7 +371,13 @@ namespace Majorsilence.Reporting.Rdl
             if (!string.IsNullOrEmpty (name))
                 table.SetAttribute ("Name", name);
 
-            // Position, size, style, DataSetName, visibility: identical elements in both versions.
+            // Position, size, style, DataSetName, visibility: identical elements in both
+            // versions. What 2008 spells differently is translated below, and what has no
+            // Table counterpart is dropped here — copying it through only earns an "unknown
+            // element" warning per report and loses it just the same.
+            XmlElement sortExpressions = null;
+            XmlElement pageBreak = null;
+            var repeatHeaderRows = false;
             foreach (var child in Children (tablix)) {
                 switch (child.LocalName) {
                     case "TablixBody":
@@ -379,16 +385,42 @@ namespace Majorsilence.Reporting.Rdl
                     case "TablixRowHierarchy":
                     case "TablixCorner":
                         continue;
+                    // Table does express these, under 2005 names.
+                    case "SortExpressions":
+                        sortExpressions = child;
+                        continue;
+                    case "PageBreak":
+                        pageBreak = child;
+                        continue;
+                    case "RepeatRowHeaders":
+                        repeatHeaderRows = XmlUtil.Boolean (child.InnerText, rl);
+                        continue;
+                    // Interactive only: frozen panes and repeated COLUMN headers describe a
+                    // scrolling viewport, which paginated output does not have.
+                    case "RepeatColumnHeaders":
+                    case "FixedColumnHeaders":
+                    case "FixedRowHeaders":
+                        continue;
                     default:
                         table.AppendChild (child.CloneNode (true));
                         break;
                 }
             }
 
+            if (pageBreak != null)
+                AppendPageBreak (table, doc, ns, pageBreak);
+
             table.AppendChild (BuildTableColumns (doc, ns, FindChild (body, "TablixColumns")));
 
-            AppendSection (table, doc, ns, "Header", rows, placements, RowPlacement.Header);
-            AppendSection (table, doc, ns, "Details", rows, placements, RowPlacement.Detail);
+            // RepeatRowHeaders is what makes column headings reappear after a page break; a
+            // long report without it reads as unlabelled columns from page two onward.
+            AppendSection (table, doc, ns, "Header", rows, placements, RowPlacement.Header,
+                repeatOnNewPage: repeatHeaderRows);
+            // 2008 hangs sorting off the data region, 2005 off the detail rows it sorts.
+            // Untranslated, the detail order is whatever the query happened to return, which
+            // is neither what the report asked for nor what SSRS shows.
+            AppendSection (table, doc, ns, "Details", rows, placements, RowPlacement.Detail,
+                sorting: sortExpressions == null ? null : BuildSorting (doc, ns, sortExpressions));
             AppendSection (table, doc, ns, "Footer", rows, placements, RowPlacement.Footer);
 
             return table;
@@ -481,7 +513,8 @@ namespace Majorsilence.Reporting.Rdl
         }
 
         private static void AppendSection (XmlElement table, XmlDocument doc, string ns, string sectionName,
-            List<XmlElement> rows, List<RowPlacement> placements, RowPlacement wanted)
+            List<XmlElement> rows, List<RowPlacement> placements, RowPlacement wanted,
+            bool repeatOnNewPage = false, XmlElement sorting = null)
         {
             var tableRows = doc.CreateElement ("TableRows", ns);
             var any = false;
@@ -499,7 +532,39 @@ namespace Majorsilence.Reporting.Rdl
 
             var section = doc.CreateElement (sectionName, ns);
             section.AppendChild (tableRows);
+            if (repeatOnNewPage) {
+                var repeat = doc.CreateElement ("RepeatOnNewPage", ns);
+                repeat.InnerText = "true";
+                section.AppendChild (repeat);
+            }
+            if (sorting != null)
+                section.AppendChild (sorting);
             table.AppendChild (section);
+        }
+
+        /// <summary>
+        /// 2008's PageBreak/BreakLocation to the 2005 pair of booleans. "StartAndEnd" sets
+        /// both; "None" sets neither, and is worth honouring rather than assuming the element's
+        /// presence means a break was wanted.
+        /// </summary>
+        private static void AppendPageBreak (XmlElement table, XmlDocument doc, string ns, XmlElement pageBreak)
+        {
+            var location = FindChild (pageBreak, "BreakLocation")?.InnerText?.Trim();
+            var atStart = string.Equals (location, "Start", StringComparison.OrdinalIgnoreCase)
+                || string.Equals (location, "StartAndEnd", StringComparison.OrdinalIgnoreCase);
+            var atEnd = string.Equals (location, "End", StringComparison.OrdinalIgnoreCase)
+                || string.Equals (location, "StartAndEnd", StringComparison.OrdinalIgnoreCase);
+
+            if (atStart) {
+                var start = doc.CreateElement ("PageBreakAtStart", ns);
+                start.InnerText = "true";
+                table.AppendChild (start);
+            }
+            if (atEnd) {
+                var end = doc.CreateElement ("PageBreakAtEnd", ns);
+                end.InnerText = "true";
+                table.AppendChild (end);
+            }
         }
 
         private static XmlElement BuildTableRow (XmlDocument doc, string ns, XmlElement tablixRow)

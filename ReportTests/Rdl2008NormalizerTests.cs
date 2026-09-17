@@ -19,7 +19,13 @@ namespace ReportTests
         private const string Rdl2008Namespace =
             "http://schemas.microsoft.com/sqlserver/reporting/2008/01/reportdefinition";
 
-        private static string TablixReport (string rowHierarchy, string rows, string columnHierarchy = null, string ns = Rdl2008Namespace)
+        /// <param name="tablixExtras">
+        /// Further children of the Tablix element: the 2008 vocabulary — SortExpressions,
+        /// RepeatRowHeaders, PageBreak — that has to be translated or deliberately dropped.
+        /// </param>
+        /// <param name="nameFieldType">rd:TypeName for the Name field, to exercise the type map.</param>
+        private static string TablixReport (string rowHierarchy, string rows, string columnHierarchy = null,
+            string ns = Rdl2008Namespace, string tablixExtras = "", string nameFieldType = "System.String")
         {
             columnHierarchy ??= @"<TablixMembers><TablixMember /><TablixMember /></TablixMembers>";
 
@@ -38,7 +44,7 @@ namespace ReportTests
     <DataSet Name=""Data"">
       <Query><DataSourceName>DS1</DataSourceName><CommandText>/* Local Query */</CommandText></Query>
       <Fields>
-        <Field Name=""Name""><DataField>Name</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name=""Name""><DataField>Name</DataField><rd:TypeName>{nameFieldType}</rd:TypeName></Field>
         <Field Name=""Amount""><DataField>Amount</DataField><rd:TypeName>System.String</rd:TypeName></Field>
       </Fields>
     </DataSet>
@@ -55,6 +61,7 @@ namespace ReportTests
         </TablixBody>
         <TablixColumnHierarchy>{columnHierarchy}</TablixColumnHierarchy>
         <TablixRowHierarchy>{rowHierarchy}</TablixRowHierarchy>
+        {tablixExtras}
         <DataSetName>Data</DataSetName>
         <Top>0in</Top>
         <Height>0.5in</Height>
@@ -520,6 +527,92 @@ namespace ReportTests
         }
 
         #endregion
+
+        /// <summary>
+        /// A row-only Tablix becomes a Table, and 2008 puts its sort on the data region while
+        /// 2005 puts it on the detail rows. Untranslated, the rows come out in whatever order
+        /// the query returned — which is not what the report asked for, and says so nowhere.
+        /// </summary>
+        [Test]
+        public async Task DetailSort_IsCarriedAcross ()
+        {
+            var rdl = TablixReport (
+                HeaderThenDetail,
+                Row ("0.25in", Cell (Textbox ("H1", "Product")), Cell (Textbox ("H2", "Price"))) +
+                Row ("0.25in", Cell (Textbox ("D1", "=Fields!Name.Value")),
+                                Cell (Textbox ("D2", "=Fields!Amount.Value"))),
+                tablixExtras: @"<SortExpressions><SortExpression>
+                                  <Value>=Fields!Name.Value</Value><Direction>Ascending</Direction>
+                                </SortExpression></SortExpressions>");
+
+            var html = await RenderHtml (rdl);
+
+            // Data order is Widget then Gadget; ascending must flip them.
+            Assert.That (html.IndexOf ("Gadget", StringComparison.Ordinal),
+                Is.GreaterThanOrEqualTo (0).And.LessThan (html.IndexOf ("Widget", StringComparison.Ordinal)),
+                "detail rows should be sorted ascending by Name");
+        }
+
+        /// <summary>
+        /// The rest of the 2008 data-region vocabulary. RepeatRowHeaders has a 2005 equivalent
+        /// and is translated; the frozen-pane hints describe a scrolling viewport that
+        /// paginated output does not have, and are dropped. Either way the report must not
+        /// accumulate an "unknown element" warning per occurrence on every single render.
+        /// </summary>
+        [Test]
+        public async Task PaginationAndFrozenPaneHints_AreHandledWithoutWarnings ()
+        {
+            var rdl = TablixReport (
+                HeaderThenDetail,
+                Row ("0.25in", Cell (Textbox ("H1", "Product")), Cell (Textbox ("H2", "Price"))) +
+                Row ("0.25in", Cell (Textbox ("D1", "=Fields!Name.Value")),
+                                Cell (Textbox ("D2", "=Fields!Amount.Value"))),
+                tablixExtras: @"<RepeatRowHeaders>true</RepeatRowHeaders>
+                                <RepeatColumnHeaders>true</RepeatColumnHeaders>
+                                <FixedRowHeaders>true</FixedRowHeaders>
+                                <FixedColumnHeaders>true</FixedColumnHeaders>
+                                <PageBreak><BreakLocation>End</BreakLocation></PageBreak>");
+
+            using var report = await ParseAsync (rdl);
+
+            Assert.That (Warnings (report), Has.None.Contains ("Unknown Table element"),
+                "2008 data-region elements should be translated or dropped, not reported");
+        }
+
+        /// <summary>
+        /// TypeCode has no member for Guid or DateTimeOffset, so Object is the right answer;
+        /// formatting and comparison reach both through IFormattable and IComparable. What was
+        /// wrong was reporting a correct mapping as an unrecognised type, once per field, on
+        /// every render — eleven and eighteen times in one real report.
+        /// </summary>
+        [TestCase ("System.Guid")]
+        [TestCase ("System.DateTimeOffset")]
+        public async Task ClrTypesWithoutATypeCode_AreRecognised (string typeName)
+        {
+            var rdl = TablixReport (
+                HeaderThenDetail,
+                Row ("0.25in", Cell (Textbox ("H1", "Product")), Cell (Textbox ("H2", "Price"))) +
+                Row ("0.25in", Cell (Textbox ("D1", "=Fields!Name.Value")),
+                                Cell (Textbox ("D2", "=Fields!Amount.Value"))),
+                nameFieldType: typeName);
+
+            using var report = await ParseAsync (rdl);
+
+            Assert.That (Warnings (report), Has.None.Contains ("is not a recognized type"),
+                typeName + " should be a recognised type name");
+        }
+
+        private static string[] Warnings (Report report)
+        {
+            var items = report?.ErrorItems;
+            if (items == null)
+                return new string[0];
+
+            var messages = new string[items.Count];
+            for (var i = 0; i < items.Count; i++)
+                messages[i] = items[i]?.ToString () ?? string.Empty;
+            return messages;
+        }
 
         private static async Task<string> RenderHtml (string rdl)
         {
